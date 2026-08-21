@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Zoom-Style Video Chat</title>
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <script src="https://unpkg.com/mqtt@4.3.7/dist/mqtt.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+    body, html { width: 100%; height: 100%; background: #0f0f10; color: #fff; overflow: hidden; }
+
+    #join-screen { display: flex; align-items: center; justify-content: center; height: 100vh; background: #1a1a1e; }
+    .card { background: #242529; padding: 30px; border-radius: 12px; width: 340px; text-align: center; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }
+    .card h2 { margin-bottom: 20px; }
+    .card input { width: 100%; padding: 12px; margin-bottom: 12px; border-radius: 6px; border: 1px solid #3a3b40; background: #1a1a1e; color: #fff; font-size: 14px; }
+    .card button { width: 100%; padding: 12px; border-radius: 6px; border: none; background: #0e71eb; color: #fff; font-weight: bold; cursor: pointer; font-size: 15px; }
+
+    #app-screen { display: none; width: 100vw; height: 100vh; position: relative; }
+    #stage { flex: 1; height: calc(100vh - 70px); display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; padding: 15px; align-items: center; justify-content: center; }
+    
+    .video-card { position: relative; width: 100%; height: 100%; max-height: 80vh; background: #1a1a1e; border-radius: 8px; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+    .video-card video { width: 100%; height: 100%; object-fit: cover; }
+    .video-card .name-tag { position: absolute; bottom: 12px; left: 12px; background: rgba(0,0,0,0.6); padding: 4px 10px; border-radius: 4px; font-size: 13px; z-index: 5; }
+
+    #local-bubble { position: absolute; bottom: 85px; right: 20px; width: 180px; height: 120px; background: #000; border-radius: 10px; overflow: hidden; border: 2px solid #3a3b40; box-shadow: 0 4px 12px rgba(0,0,0,0.5); z-index: 10; }
+    #local-bubble video { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+
+    #chat-sidebar { position: absolute; top: 0; right: -320px; width: 320px; height: calc(100vh - 70px); background: #1a1a1e; border-left: 1px solid #2a2b30; display: flex; flex-direction: column; transition: right 0.3s ease; z-index: 15; }
+    #chat-sidebar.open { right: 0; }
+    .chat-header { padding: 15px; border-bottom: 1px solid #2a2b30; font-weight: bold; display: flex; justify-content: space-between; }
+    #chat-messages { flex: 1; padding: 15px; overflow-y: auto; font-size: 14px; }
+    .msg { margin-bottom: 10px; line-height: 1.4; word-break: break-word; }
+    .msg-sender { font-weight: bold; color: #0e71eb; }
+    .chat-input-area { padding: 15px; border-top: 1px solid #2a2b30; display: flex; gap: 8px; }
+    .chat-input-area input { flex: 1; padding: 8px; border-radius: 4px; border: 1px solid #3a3b40; background: #242529; color: #fff; }
+    .chat-input-area button { padding: 8px 12px; border-radius: 4px; border: none; background: #0e71eb; color: #fff; cursor: pointer; }
+
+    #control-bar { position: absolute; bottom: 0; left: 0; width: 100%; height: 70px; background: #1a1a1e; border-top: 1px solid #2a2b30; display: flex; align-items: center; justify-content: center; gap: 15px; z-index: 20; }
+    .ctrl-btn { background: #242529; border: 1px solid #3a3b40; color: #fff; padding: 10px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+    .ctrl-btn.danger { background: #e02424; border: none; }
+  </style>
+</head>
+<body>
+
+  <div id="join-screen">
+    <div class="card">
+      <h2>Join Meeting</h2>
+      <input type="text" id="display-name" placeholder="Your Display Name">
+      <input type="text" id="room-code" placeholder="Room Code (e.g., Room123)">
+      <button onclick="startApp()">Enter Room</button>
+    </div>
+  </div>
+
+  <div id="app-screen">
+    <div id="stage"></div>
+
+    <div id="local-bubble">
+      <video id="local-video" autoplay muted playsinline></video>
+    </div>
+
+    <div id="chat-sidebar">
+      <div class="chat-header">
+        <span>In-Meeting Chat</span>
+        <span style="cursor:pointer;" onclick="toggleChat()">✕</span>
+      </div>
+      <div id="chat-messages"></div>
+      <div class="chat-input-area">
+        <input type="text" id="chat-msg" placeholder="Type message..." onkeydown="if(event.key==='Enter') sendChat()">
+        <button onclick="sendChat()">Send</button>
+      </div>
+    </div>
+
+    <div id="control-bar">
+      <button class="ctrl-btn" onclick="toggleAudio()" id="audio-btn">Mute Audio</button>
+      <button class="ctrl-btn" onclick="toggleVideo()" id="video-btn">Stop Video</button>
+      <button class="ctrl-btn" onclick="toggleChat()">Chat</button>
+      <button class="ctrl-btn danger" onclick="location.reload()">Leave Meeting</button>
+    </div>
+  </div>
+
+<script>
+  let peer = null;
+  let mqttClient = null;
+  let localStream = null;
+  let myPeerId = '';
+  let myName = '';
+  let roomCode = '';
+  const activeCalls = {};
+  const peerNames = {};
+
+  async function startApp() {
+    myName = document.getElementById('display-name').value.trim();
+    roomCode = document.getElementById('room-code').value.trim().toLowerCase();
+    if (!myName || !roomCode) return alert('Please enter both your name and room code.');
+
+    document.getElementById('join-screen').style.display = 'none';
+    document.getElementById('app-screen').style.display = 'flex';
+
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      document.getElementById('local-video').srcObject = localStream;
+    } catch (err) {
+      alert('Could not access camera/microphone.');
+      return;
+    }
+
+    // Initialize PeerJS with public STUN servers for network traversal
+    peer = new Peer({
+      config: { 'iceServers': [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }] }
+    });
+
+    peer.on('open', id => {
+      myPeerId = id;
+      initSignaling();
+    });
+
+    peer.on('call', call => {
+      call.answer(localStream);
+      call.on('stream', remoteStream => {
+        const callerName = peerNames[call.peer] || 'Participant';
+        addRemoteStream(call.peer, remoteStream, callerName);
+      });
+      activeCalls[call.peer] = call;
+    });
+  }
+
+  function initSignaling() {
+    // Connect to free public WebSocket signaling broker
+    mqttClient = mqtt.connect('wss://broker.hivemq.com:8884/mqtt');
+    const topic = 'custom-zoom-app-room/' + roomCode;
+
+    mqttClient.on('connect', () => {
+      mqttClient.subscribe(topic);
+      // Broadcast arrival to room
+      mqttClient.publish(topic, JSON.stringify({ type: 'join', peerId: myPeerId, name: myName }));
+    });
+
+    mqttClient.on('message', (t, msg) => {
+      const data = JSON.parse(msg.toString());
+      if (data.peerId === myPeerId) return;
+
+      if (data.type === 'join') {
+        peerNames[data.peerId] = data.name;
+        // Reply to new joiner so they know we are in the room
+        mqttClient.publish(topic, JSON.stringify({ type: 'announce', targetId: data.peerId, peerId: myPeerId, name: myName }));
+        makeCall(data.peerId, data.name);
+      } 
+      else if (data.type === 'announce' && data.targetId === myPeerId) {
+        peerNames[data.peerId] = data.name;
+        makeCall(data.peerId, data.name);
+      } 
+      else if (data.type === 'chat') {
+        appendMessage(data.name, data.message);
+      }
+    });
+  }
+
+  function makeCall(remotePeerId, remoteName) {
+    if (activeCalls[remotePeerId]) return;
+    const call = peer.call(remotePeerId, localStream);
+    activeCalls[remotePeerId] = call;
+    
+    call.on('stream', remoteStream => {
+      addRemoteStream(remotePeerId, remoteStream, remoteName);
+    });
+  }
+
+  function addRemoteStream(peerId, stream, name) {
+    if (document.getElementById(`card-${peerId}`)) return;
+
+    const stage = document.getElementById('stage');
+    const card = document.createElement('div');
+    card.className = 'video-card';
+    card.id = `card-${peerId}`;
+
+    const video = document.createElement('video');
+    video.srcObject = stream;
+    video.autoplay = true;
+    video.playsInline = true;
+
+    const nameTag = document.createElement('div');
+    nameTag.className = 'name-tag';
+    nameTag.innerText = name;
+
+    card.appendChild(video);
+    card.appendChild(nameTag);
+    stage.appendChild(card);
+  }
+
+  function sendChat() {
+    const input = document.getElementById('chat-msg');
+    const msg = input.value.trim();
+    if (!msg) return;
+
+    const topic = 'custom-zoom-app-room/' + roomCode;
+    mqttClient.publish(topic, JSON.stringify({ type: 'chat', name: myName, message: msg }));
+    input.value = '';
+  }
+
+  function appendMessage(sender, message) {
+    const box = document.getElementById('chat-messages');
+    const div = document.createElement('div');
+    div.className = 'msg';
+    div.innerHTML = `<span class="msg-sender">${sender}:</span> ${message}`;
+    box.appendChild(div);
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function toggleChat() {
+    document.getElementById('chat-sidebar').classList.toggle('open');
+  }
+
+  function toggleAudio() {
+    const track = localStream.getAudioTracks()[0];
+    track.enabled = !track.enabled;
+    document.getElementById('audio-btn').innerText = track.enabled ? 'Mute Audio' : 'Unmute Audio';
+  }
+
+  function toggleVideo() {
+    const track = localStream.getVideoTracks()[0];
+    track.enabled = !track.enabled;
+    document.getElementById('video-btn').innerText = track.enabled ? 'Stop Video' : 'Start Video';
+  }
+</script>
+</body>
+</html>
